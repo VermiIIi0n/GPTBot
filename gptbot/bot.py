@@ -161,12 +161,6 @@ class FullResponse(BaseModel):
     usage: Usage
 
 
-class Session(BaseModel):
-    sid: str = Field(default_factory=lambda: str(uuid4()))
-    bot: Bot
-    messages: list[Message]
-
-
 class Bot(BaseModel):
     """
     # ChatGPT bot
@@ -243,7 +237,7 @@ class Bot(BaseModel):
     def trim(self, target_max: int | None = None) -> int:
         """
         Trim the session until it's less than `target_max` tokens.
-        Returns the number of tokens after trimming.
+        Returns the total number of tokens after trimming.
         """
         if target_max is None:
             model_max_tokens = INFO_MAP[self.model].max_tokens
@@ -276,20 +270,21 @@ class Bot(BaseModel):
                     raise ValueError(f"Invalid segment type: {seg['type']}")
             return size
         num_tokens = 4 + sizeof_prompt(self.prompt)
-        if num_tokens > target_max:
-            raise ValueError("The prompt is already too long")
         num_tokens += 2  # every reply is primed with <im_start>assistant
+        if num_tokens >= target_max:
+            raise ValueError("The prompt is already too long")
         msg_cnt = 0
         for message in reversed(self._sess):
             # every message follows <im_start>{role/name}\n{content}<im_end>\n
-            num_tokens += 4
+            this_tokens = 4
             for key, value in message.items():
-                num_tokens += sizeof_prompt(value)
+                this_tokens += sizeof_prompt(value)
                 if key == "name":  # if there's a name, the role is omitted
-                    num_tokens -= 1  # role is always required and always 1 token
-            if num_tokens > target_max:
+                    this_tokens -= 1  # role is always required and always 1 token
+            if num_tokens + this_tokens >= target_max:
                 break
             msg_cnt += 1
+            num_tokens += this_tokens
         self._sess = self._sess[len(self._sess)-msg_cnt:]
         return num_tokens
 
@@ -297,7 +292,7 @@ class Bot(BaseModel):
         """
         Roll back `num` messages.
         """
-        self._sess = self._sess[:-num]
+        self._sess = self._sess[:len(self._sess)-num]
 
     def clear(self):
         """
@@ -314,7 +309,8 @@ class Bot(BaseModel):
                          ) -> AsyncGenerator[FullChunkResponse, None]:
         self._sess.append({
             "role": role.value, "content": await self._proc_prompt(prompt)})
-        self.trim()
+        n = self.trim()
+        print(f"Trimmed to {n} tokens")
 
         async with self._cli.stream(
             "POST",
@@ -487,7 +483,7 @@ class Bot(BaseModel):
                   choices: int = 1
                   ) -> dict[str, Any]:
         ret: dict[str, Any] = {
-            "messages": ({"role": "system", "content": self.prompt}, *self._sess),
+            "messages": [{"role": "system", "content": self.prompt}] + self._sess,
             "model": self.model.value,
             "frequency_penalty": self.frequency_penalty,
             "logit_bias": self.logit_bias,
