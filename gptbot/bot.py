@@ -87,6 +87,9 @@ class Message(BaseModel):
         type: Literal["text"] = "text"
         text: str
 
+        def __str__(self):
+            return self.text
+
     class ImageSegment(BaseSegment):
         model_config = ConfigDict(extra="allow")
 
@@ -106,8 +109,16 @@ class Message(BaseModel):
                 return cls.ImageURL.model_validate(value)
             return value
 
+        def __str__(self):
+            return f"#image({self.image_url.url[:10]}...{self.image_url.url[-10:]})"
+
     role: Role
     content: str | list[TextSegment | ImageSegment] = ""
+
+    def __str__(self):
+        if isinstance(self.content, str):
+            return self.content
+        return ''.join(str(seg) for seg in self.content)
 
 
 SegTypes: TypeAlias = Message.TextSegment | Message.ImageSegment
@@ -170,8 +181,8 @@ class Bot(BaseModel):
     - `api_key` (str): OpenAI API key
     - `prompt` (str): Initial prompt
     - `temperature` (float): The higher the temperature, the crazier the text (0.0 to 1.0)
-    - `trim_thre` (float | int): When the value is above 1, it's the maximum used tokens,
-        when it's below 1, it's the maximum used ratio of tokens. Session will be trimmed if condition is not met.
+    - `comp_tokens` (float | int): Reserved tokens for completion, when value is in (0, 1), it represents a ratio,
+        [1,-] represents tokens count, 0 for auto mode
     - `top_p` (float): Nucleus sampling: limits the generated guesses to a cumulative probability. (0.0 to 1.0)
     - `frequency_penalty` (float): Adjusts the frequency of words in the generated text. (0.0 to 1.0)
     - `presence_penalty` (float): Adjusts the presence of words in the generated text. (0.0 to 1.0)
@@ -182,7 +193,7 @@ class Bot(BaseModel):
     model: Model
     api_key: str
     api_url: str = "https://api.openai.com/v1/chat/completions"
-    trim_thre: float | int = 0.9
+    comp_tokens: float | int = 0
 
     # See https://platform.openai.com/docs/api-reference/chat/create
     prompt: str = ""
@@ -190,7 +201,6 @@ class Bot(BaseModel):
     logit_bias: dict[str, float] | None = None
     logprobs: bool | None = None
     top_logprobs: int | None = None
-    max_reply_tokens: int | None = None
     presence_penalty: float | None = None
     seed: int | None = None
     stop: list[str] | None = None
@@ -202,6 +212,7 @@ class Bot(BaseModel):
 
     proxy: str | None = None
     timeout: float | None = None
+    # retries: int = 5
     _sess: list[dict] = PrivateAttr(default_factory=list)
     _cli: httpx.AsyncClient = PrivateAttr(default=None)
 
@@ -225,6 +236,10 @@ class Bot(BaseModel):
             warn(f"{value} is a legacy model", DeprecationWarning)
         return value
 
+    @field_validator("comp_tokens")
+    def check_range(cls, value: int | float):
+        return max(0, value)
+
     def respawn_cli(self, **kw):
         """
         Create a new HTTP client, replacing the old one if it exists.
@@ -241,10 +256,10 @@ class Bot(BaseModel):
         """
         if target_max is None:
             model_max_tokens = INFO_MAP[self.model].max_tokens
-            if self.trim_thre < 1:
-                target_max = int(self.trim_thre * model_max_tokens)
+            if self.comp_tokens < 1:
+                target_max = int((1-self.comp_tokens) * model_max_tokens)
             else:
-                target_max = min(model_max_tokens, int(self.trim_thre))
+                target_max = max(0, model_max_tokens-int(self.comp_tokens))
 
         # modified from official doc: https://platform.openai.com/docs/guides/text-generation/managing-tokens
         try:
@@ -309,14 +324,14 @@ class Bot(BaseModel):
                          ) -> AsyncGenerator[FullChunkResponse, None]:
         self._sess.append({
             "role": role.value, "content": await self._proc_prompt(prompt)})
-        n = self.trim()
-        print(f"Trimmed to {n} tokens")
+        used_tokens = self.trim()
 
         async with self._cli.stream(
             "POST",
             self.api_url,
             headers={"Authorization": "Bearer " + self.api_key},
-            json=self._get_json(ensure_json, stream=True, choices=choices)
+            json=self._get_json(
+                ensure_json, stream=True, choices=choices, used_tokens=used_tokens)
         ) as r:
             if r.status_code != 200:
                 await r.aread()
@@ -377,12 +392,11 @@ class Bot(BaseModel):
                        ) -> FullResponse:
         self._sess.append({
             "role": role.value, "content": await self._proc_prompt(prompt)})
-        self.trim()
-
+        used_tokens = self.trim()
         r = await self._cli.post(
             self.api_url,
             headers={"Authorization": "Bearer " + self.api_key},
-            json=self._get_json(ensure_json, choices=choices)
+            json=self._get_json(ensure_json, choices=choices, used_tokens=used_tokens)
         )
         if r.status_code != 200:
             raise RuntimeError(
@@ -480,15 +494,26 @@ class Bot(BaseModel):
     def _get_json(self,
                   ensure_json: bool = False,
                   stream: bool = False,
-                  choices: int = 1
+                  choices: int = 1,
+                  used_tokens: int = 0
                   ) -> dict[str, Any]:
+
+        total_tokens = INFO_MAP[self.model].max_tokens
+        spare_tokens = total_tokens - used_tokens
+        if self.comp_tokens == 0:
+            comp_tokens = spare_tokens
+        elif self.comp_tokens < 1:
+            comp_tokens = int(min(self.comp_tokens*total_tokens, spare_tokens))
+        else:
+            comp_tokens = int(min(self.comp_tokens, spare_tokens))
         ret: dict[str, Any] = {
             "messages": [{"role": "system", "content": self.prompt}] + self._sess,
             "model": self.model.value,
             "frequency_penalty": self.frequency_penalty,
             "logit_bias": self.logit_bias,
             "logprobs": self.logprobs,
-            "max_tokens": self.max_reply_tokens or INFO_MAP[self.model].max_tokens,
+            # limited by openai but not specified anythere...
+            "max_tokens": min(4096, comp_tokens),
             "n": choices,
             "presence_penalty": self.presence_penalty,
             "seed": self.seed,

@@ -7,7 +7,7 @@ from traceback import format_exc
 from pathlib import Path
 from getpass import getpass
 from gptbot import bot, __author__, __version__
-from platformdirs import user_cache_dir
+from platformdirs import user_cache_dir, user_config_dir
 
 
 async def main():
@@ -15,11 +15,13 @@ async def main():
 
     cache_dir = Path(user_cache_dir(
         "gptbot", __author__, __version__, ensure_exists=True))
+    config_dir = Path(user_config_dir(
+        "gptbot", __author__, __version__, ensure_exists=True))
 
     parser.add_argument("-m", "--model", help="Model name",
                         choices=list(e.value for e in bot.Model), default=None)
     parser.add_argument("-c", "--config", help="Path to config file",
-                        default=cache_dir / "config.json")
+                        default=config_dir / "config.json")
     parser.add_argument("-s", "--session",
                         help="Path to session file", default=cache_dir / "session.json")
     parser.add_argument("-k", "--create-config",
@@ -64,11 +66,20 @@ async def main():
         if create_config:
             print(f"Config file already exists: {config_path}")
             return
+        print(f"Loading config file: {config_path}")
         with open(config_path, 'r') as f:
             b = bot.Bot.model_validate_json(f.read())
 
         if model:
             b.model = model
+
+    if not session_path.exists():
+        print(f"Session file not found: {session_path}")
+        print("Starting new session")
+    else:
+        print(f"Loading session file: {session_path}")
+        with open(session_path, 'r') as f:
+            b._sess = json.load(f)
 
     if not b.api_key:
         b.api_key = getpass("Enter your OpenAI API key: ")
@@ -79,12 +90,19 @@ async def main():
         b.proxy = proxy
         print(f"Using system proxy: {b.proxy}")
 
-    if session_path.exists():
-        with open(session_path, 'r') as f:
-            b._sess = json.load(f)
-
     print("\nChat started:", end="\n\n")
     print(f"System: {b.prompt}", end="\n\n")
+    namemap = {
+        "user": "You",
+        "assistant": "Bot",
+        "system": "System",
+    }
+    revisit_n = 2
+    session = b.session
+    if len(session) > revisit_n + 1:
+        print("...", end="\n\n")
+    for h in session[1:][-revisit_n:]:
+        print(f"{namemap[h.role.value]}: {str(h)}", end="\n\n")
 
     try:
         while True:
@@ -126,6 +144,7 @@ async def main():
                             b.rollback(int(num))
                             print(f"Session rolled back {num} steps")
                         case ["role"]:
+                            print(f"Current role {role.value}")
                             print("Choose a role from the following list:")
                             roles = tuple(bot.Role)
                             for i, r in enumerate(roles):
@@ -137,6 +156,7 @@ async def main():
                             except (ValueError, IndexError):
                                 print("Invalid input")
                         case ["model"]:
+                            print(f"Current model {b.model.value}")
                             print("Choose a model from the following list:")
                             models = tuple(bot.Model)
                             for i, m in enumerate(models):
@@ -148,6 +168,8 @@ async def main():
                                 b.model = model
                             except (ValueError, IndexError):
                                 print("Invalid input")
+                        case ["tokens"]:
+                            print(f"Used tokens(approximately): {b.trim()}")
                         case ["help"]:
                             print("Commands:")
                             print("\t/exit")
@@ -160,6 +182,7 @@ async def main():
                             print("\t/rollback <num>")
                             print("\t/role")
                             print("\t/model")
+                            print("\t/tokens")
                             print("\t/help")
                             print("\tTo embed an image, use #image(<url>)")
                         case _:

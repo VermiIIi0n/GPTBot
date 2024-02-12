@@ -22,7 +22,7 @@ pip install -U ngptbot
 
 You can use config file, command parameters or interactive input to set these values.
 
-By default, `gptbot` will look for files named `config.json` and `session.json` in the user cache directory.
+By default, `gptbot` will look for files named `config.json` and `session.json` in the user config and cache directory.
 
 ```bash
 gptbot -c /path/to/config.json  # Use a config file
@@ -53,6 +53,7 @@ Commands are started with a `/` and are **case-sensitive**.
 - `/clear`: Clear the session history
 - `/role`: Switch role
 - `/model`: Switch model
+- `/tokens`: Show used tokens
 - `/help`: Show help
 
 To embed an image, insert `#image(<url>)` in your message.
