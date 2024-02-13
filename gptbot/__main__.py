@@ -10,13 +10,16 @@ from gptbot import bot, __author__, __version__
 from platformdirs import user_cache_dir, user_config_dir
 
 
+CONFIG_VERSION = "0.2.0"
+SESSION_VERSION = "0.2.0"
+
 async def main():
     parser = argparse.ArgumentParser(description="GPTBot")
 
     cache_dir = Path(user_cache_dir(
-        "gptbot", __author__, __version__, ensure_exists=True))
+        "gptbot", __author__, SESSION_VERSION, ensure_exists=True))
     config_dir = Path(user_config_dir(
-        "gptbot", __author__, __version__, ensure_exists=True))
+        "gptbot", __author__, CONFIG_VERSION, ensure_exists=True))
 
     parser.add_argument("-m", "--model", help="Model name",
                         choices=list(e.value for e in bot.Model), default=None)
@@ -58,8 +61,7 @@ async def main():
         b = bot.Bot(model=model, api_key=api_key, timeout=20)
 
         if create_config:
-            with open(config_path, 'w') as f:
-                f.write(b.model_dump_json(indent=4))
+            config_path.write_text(b.model_dump_json(indent=4))
             print(f"Config file created: {config_path}")
             return
     else:
@@ -67,8 +69,7 @@ async def main():
             print(f"Config file already exists: {config_path}")
             return
         print(f"Loading config file: {config_path}")
-        with open(config_path, 'r') as f:
-            b = bot.Bot.model_validate_json(f.read())
+        b = bot.Bot.model_validate_json(config_path.read_text())
 
         if model:
             b.model = model

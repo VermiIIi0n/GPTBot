@@ -48,7 +48,7 @@ Commands are started with a `/` and are **case-sensitive**.
 
 - `/exit`: Exit the program
 - `/save <path>`: Save the session history to a file
-- `/load`: Load a session history from a file
+- `/load <path>`: Load a session history from a file
 - `/rollback <step>`: Rollback to the previous state
 - `/clear`: Clear the session history
 - `/role`: Switch role
