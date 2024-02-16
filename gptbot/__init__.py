@@ -1,4 +1,4 @@
 from .bot import *
 
 __author__ = "VermiIIi0n"
-__version__ = "0.2.2"
+__version__ = "0.3.0"

@@ -93,5 +93,14 @@ async def main():
 
     bot.send_sync("Goodbye!")  # Synchronous version of `send`
 
+    # Bot class is stateless, to keep track of the conversation, use the `Session` class
+    session = bot.new_session()
+
+    # You can use session just like the bot
+    async for r in session.stream("Hello!"):
+        print(r, end='')
+
+    print(await session.send("Goodbye!"))
+
 asyncio.run(main())
 ```

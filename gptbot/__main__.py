@@ -11,7 +11,8 @@ from platformdirs import user_cache_dir, user_config_dir
 
 
 CONFIG_VERSION = "0.2.0"
-SESSION_VERSION = "0.2.0"
+SESSION_VERSION = "0.3.0"
+
 
 async def main():
     parser = argparse.ArgumentParser(description="GPTBot")
@@ -77,10 +78,11 @@ async def main():
     if not session_path.exists():
         print(f"Session file not found: {session_path}")
         print("Starting new session")
+        session = b.new_session()
     else:
         print(f"Loading session file: {session_path}")
         with open(session_path, 'r') as f:
-            b._sess = json.load(f)
+            session = bot.Session(bot=b, **json.load(f))
 
     if not b.api_key:
         b.api_key = getpass("Enter your OpenAI API key: ")
@@ -99,7 +101,6 @@ async def main():
         "system": "System",
     }
     revisit_n = 2
-    session = b.session
     if len(session) > revisit_n + 1:
         print("...", end="\n\n")
     for h in session[1:][-revisit_n:]:
@@ -118,31 +119,29 @@ async def main():
                         case ["exit"]:
                             break
                         case ["save"]:
-                            with open(session_path, 'w') as f:
-                                json.dump(b._sess, f)
+                            session_path.write_text(session.model_dump_json(indent=4))
                             print(f"Session saved to {session_path}")
                         case ["save", path]:
                             session_path = Path(path)
-                            with open(session_path, 'w') as f:
-                                json.dump(b._sess, f)
+                            session_path.write_text(session.model_dump_json(indent=4))
                             print(f"Session saved to {session_path}")
                         case ["load"]:
                             with open(session_path, 'r') as f:
-                                b._sess = json.load(f)
+                                session = bot.Session(bot=b, **json.load(f))
                             print(f"Session loaded from {session_path}")
                         case ["load", path]:
                             session_path = Path(path)
                             with open(session_path, 'r') as f:
-                                b._sess = json.load(f)
+                                session = bot.Session(bot=b, **json.load(f))
                             print(f"Session loaded from {session_path}")
                         case ["clear"]:
-                            b.clear()
+                            session.clear()
                             print("Session cleared")
                         case ["rollback"]:
-                            b.rollback(1)
+                            session.rollback(1)
                             print("Session rolled back")
                         case ["rollback", num]:
-                            b.rollback(int(num))
+                            session.rollback(int(num))
                             print(f"Session rolled back {num} steps")
                         case ["role"]:
                             print(f"Current role {role.value}")
@@ -170,7 +169,7 @@ async def main():
                             except (ValueError, IndexError):
                                 print("Invalid input")
                         case ["tokens"]:
-                            print(f"Used tokens(approximately): {b.trim()}")
+                            print(f"Used tokens(approximately): {session.trim()}")
                         case ["help"]:
                             print("Commands:")
                             print("\t/exit")
@@ -216,7 +215,7 @@ async def main():
 
                 print("Bot: ", end='', flush=True)
                 try:
-                    async for res in b.stream(prompt, role):
+                    async for res in session.stream(prompt, role):
                         print(res, end='', flush=True)
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     print("\n<Interrupted>")
@@ -233,8 +232,7 @@ async def main():
         user_input = input("Save session? (Y/n): ")
         user_input = user_input.strip() or 'y'
         if user_input.lower() == 'y':
-            with open(session_path, 'w') as f:
-                json.dump(b._sess, f)
+            session_path.write_text(session.model_dump_json(indent=4))
             print(f"Session saved to {session_path}")
 
 asyncio.run(main())

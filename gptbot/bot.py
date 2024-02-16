@@ -7,13 +7,14 @@ import httpx
 import ujson as json
 import tiktoken
 import math
-from typing import Any, Self, AsyncGenerator, Literal, Generator
-from typing import TypeAlias, cast
+from typing import Any, Iterable, Self, AsyncGenerator, Literal, Generator, overload
+from typing import TypeAlias, cast, Sequence
 from enum import Enum
 from datetime import datetime
 from warnings import warn
 from pydantic import BaseModel, Field, validate_call, PrivateAttr
 from pydantic import field_validator, model_validator, ConfigDict
+from pydantic import field_serializer
 from vermils.asynctools import sync_await
 from PIL import Image, UnidentifiedImageError
 from pathlib import Path
@@ -27,6 +28,7 @@ class Model(str, Enum):
     GPT4TurboPreview = "gpt-4-turbo-preview"
     GPT4_1106_Preview = "gpt-4-1106-preview"
     GPT4VisionPreview = "gpt-4-vision-preview"
+    GPT4_1106_VisionPreview = "gpt-4-1106-vision-preview"
     GPT4 = "gpt-4"
     GPT4_0613 = "gpt-4-0613"
     GPT4_32K = "gpt-4-32k"
@@ -53,6 +55,7 @@ INFO_MAP: dict[Model, ModelInfo] = {
     Model.GPT4TurboPreview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
     Model.GPT4_1106_Preview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
     Model.GPT4VisionPreview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
+    Model.GPT4_1106_VisionPreview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
     Model.GPT4: ModelInfo(max_tokens=8192, updated_at=datetime(2021, 9, 1)),
     Model.GPT4_0613: ModelInfo(max_tokens=8192, updated_at=datetime(2021, 9, 1)),
     Model.GPT4_32K: ModelInfo(max_tokens=32768, updated_at=datetime(2021, 9, 1)),
@@ -99,6 +102,7 @@ class Message(BaseModel):
         type: Literal["image_url"] = "image_url"
         image_url: ImageURL
         _cache: Image.Image | None = None
+        _dims: tuple[int, int] = (0, 0)
 
         @field_validator("image_url", mode="before")
         def convert_url(cls, value: str | ImageURL | dict) -> ImageURL:
@@ -108,10 +112,26 @@ class Message(BaseModel):
                 return cls.ImageURL.model_validate(value)
             return value
 
+        @field_serializer("image_url", when_used="json")
+        def to_b64(self, img_url: ImageURL, _) -> dict:
+            url = img_url.url
+            if url.startswith("base64://"):
+                url = f"data:image/jpeg;base64,{self.image_url.url[9:]}"
+            if self._cache is not None:
+                img = self._cache
+                jpeg_data = BytesIO()
+                img.convert("RGB").save(jpeg_data, format="jpeg",
+                                        optimize=True, quality=85)
+                jpeg_data.seek(0)
+                url = f"data:image/jpeg;base64,{
+                    b64encode(jpeg_data.read()).decode('utf-8')}"
+            return self.ImageURL(url=url, detail=img_url.detail).model_dump(mode="json")
+
         def __str__(self):
             return f"#image({self.image_url.url[:10]}...{self.image_url.url[-10:]})"
 
     role: Role
+    name: str | None = None
     content: str | list[TextSegment | ImageSegment] = ""
 
     def __str__(self):
@@ -212,19 +232,10 @@ class Bot(BaseModel):
     proxy: str | None = None
     timeout: float | None = None
     # retries: int = 5
-    _sess: list[dict] = PrivateAttr(default_factory=list)
+    # backoff: float = 1.5
     _cli: httpx.AsyncClient = PrivateAttr(default=None)
     _last_proxy: str | None = PrivateAttr(default=None)
     _last_timeout: float | None = PrivateAttr(default=None)
-
-    @property
-    def session(self) -> tuple[Message, ...]:
-        return (Message(role=Role.System, content=self.prompt),
-                *(Message.model_validate(m) for m in self._sess))
-
-    @session.setter
-    def session(self, value: list[Message | dict]):
-        self._sess = [m.model_dump() if isinstance(m, BaseModel) else m for m in value]
 
     @model_validator(mode="after")
     def post_init(self) -> Self:
@@ -254,91 +265,32 @@ class Bot(BaseModel):
                                       trust_env=False,
                                       **kw)
 
-    def trim(self, target_max: int | None = None) -> int:
-        """
-        Trim the session until it's less than `target_max` tokens.
-        Returns the total number of tokens after trimming.
-        """
-        if target_max is None:
-            model_max_tokens = INFO_MAP[self.model].max_tokens
-            if self.comp_tokens < 1:
-                target_max = int((1-self.comp_tokens) * model_max_tokens)
-            else:
-                target_max = max(0, model_max_tokens-int(self.comp_tokens))
+    def new_session(
+            self, messages: Iterable[Message] = tuple()) -> Session:
+        return Session(bot=self, messages=list(messages))
 
-        # modified from official doc: https://platform.openai.com/docs/guides/text-generation/managing-tokens
-        try:
-            encoding = tiktoken.encoding_for_model(self.model.value)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
-
-        def sizeof_prompt(prompt: str | list[dict]) -> int:
-            if isinstance(prompt, str):
-                return len(encoding.encode(prompt))
-            size = 0
-            for seg in prompt:
-                if seg["type"] == "text":
-                    size += len(encoding.encode(seg["text"]))
-                elif seg["type"] == "image_url":
-                    # from https://community.openai.com/t/how-do-i-calculate-image-tokens-in-gpt4-vision/492318
-                    size += 85
-                    if seg["image_url"]["detail"] != "low":
-                        size += 170 * \
-                            math.ceil(seg["dims"][0] / 512) * \
-                            math.ceil(seg["dims"][1] / 512)
-                else:
-                    raise ValueError(f"Invalid segment type: {seg['type']}")
-            return size
-        num_tokens = 4 + sizeof_prompt(self.prompt)
-        num_tokens += 2  # every reply is primed with <im_start>assistant
-        if num_tokens >= target_max:
-            raise ValueError("The prompt is already too long")
-        msg_cnt = 0
-        for message in reversed(self._sess):
-            # every message follows <im_start>{role/name}\n{content}<im_end>\n
-            this_tokens = 4
-            for key, value in message.items():
-                this_tokens += sizeof_prompt(value)
-                if key == "name":  # if there's a name, the role is omitted
-                    this_tokens -= 1  # role is always required and always 1 token
-            if num_tokens + this_tokens >= target_max:
-                break
-            msg_cnt += 1
-            num_tokens += this_tokens
-        self._sess = self._sess[len(self._sess)-msg_cnt:]
-        return num_tokens
-
-    def rollback(self, num: int):
-        """
-        Roll back `num` messages.
-        """
-        self._sess = self._sess[:len(self._sess)-num]
-
-    def clear(self):
-        """
-        Clear the session.
-        """
-        self._sess.clear()
-
-    @validate_call
     async def stream_raw(self,
                          prompt: Prompt,
                          role: Role = Role.User,
                          ensure_json: bool = False,
-                         choices: int = 1
+                         choices: int = 1,
+                         session: Session | None = None
                          ) -> AsyncGenerator[FullChunkResponse, None]:
-        self._sess.append({
-            "role": role.value, "content": await self._proc_prompt(prompt)})
-        used_tokens = self.trim()
+        session = self.new_session() if session is None else session
+        session.append(Message(
+            role=role.value, content=await self._proc_prompt(prompt)))
+        used_tokens = session.trim(bot=self)
 
         async with self._cli.stream(
             "POST",
             self.api_url,
             headers={"Authorization": "Bearer " + self.api_key},
             json=self._get_json(
-                ensure_json, stream=True, choices=choices, used_tokens=used_tokens)
+                session,
+                ensure_json=ensure_json, stream=True, choices=choices, used_tokens=used_tokens)
         ) as r:
             if r.status_code != 200:
+                session.pop()
                 await r.aread()
                 raise RuntimeError(
                     f"{r.status_code} {r.reason_phrase} {r.text}",
@@ -353,11 +305,11 @@ class Bot(BaseModel):
                 ret = FullChunkResponse.model_validate(json.loads(data))
                 yield ret
 
-    @validate_call
     async def stream(self,
                      prompt: Prompt,
                      role: Role = Role.User,
                      ensure_json: bool = False,
+                     session: Session | None = None
                      ) -> AsyncGenerator[str, None]:
         """
         Stream messages from the bot.
@@ -366,21 +318,22 @@ class Bot(BaseModel):
         - `prompt` (str): What to say
         - `role` (Role): Role of the speaker
         - `ensure_json` (bool): Ensure the response is a valid JSON object
+        - `session` (Session): Session to use
         """
 
-        msg = {"role": role.value, "content": ""}
-        async for r in self.stream_raw(prompt, role, ensure_json, 1):
+        content = ''
+        async for r in self.stream_raw(prompt, role, ensure_json, 1, session):
             choice = r.choices[0]
             if choice.finish_reason is not None:
                 continue
             if choice.delta.role is not None:
-                msg["role"] = choice.delta.role.value
+                role = choice.delta.role
             if choice.delta.content is not None:
-                msg["content"] += choice.delta.content
+                content += choice.delta.content
                 yield choice.delta.content
-        self._sess.append(msg)
+        if session is not None:
+            session.append(Message(role=role.value, content=content))
 
-    @validate_call
     def stream_sync(self,
                     prompt: Prompt,
                     role: Role = Role.User,
@@ -388,20 +341,24 @@ class Bot(BaseModel):
                     ) -> Generator[str, None, None]:
         raise NotImplementedError
 
-    @validate_call
     async def send_raw(self,
                        prompt: Prompt,
                        role: Role = Role.User,
                        ensure_json: bool = False,
-                       choices: int = 1
+                       choices: int = 1,
+                       session: Session | None = None
                        ) -> FullResponse:
-        self._sess.append({
-            "role": role.value, "content": await self._proc_prompt(prompt)})
-        used_tokens = self.trim()
+        session = self.new_session() if session is None else session
+        session.append(Message(
+            role=role.value, content=await self._proc_prompt(prompt)))
+        used_tokens = session.trim(bot=self)
+
         r = await self._cli.post(
             self.api_url,
             headers={"Authorization": "Bearer " + self.api_key},
-            json=self._get_json(ensure_json, choices=choices, used_tokens=used_tokens)
+            json=self._get_json(
+                session,
+                ensure_json=ensure_json, choices=choices, used_tokens=used_tokens)
         )
         if r.status_code != 200:
             raise RuntimeError(
@@ -410,11 +367,11 @@ class Bot(BaseModel):
         ret = FullResponse.model_validate(json.loads(r.text))
         return ret
 
-    @validate_call
     async def send(self,
                    prompt: Prompt,
                    role: Role = Role.User,
                    ensure_json: bool = False,
+                   session: Session | None = None
                    ) -> str:
         """
         Send a message to the bot.
@@ -423,11 +380,14 @@ class Bot(BaseModel):
         - `prompt` (str): What to say
         - `role` (Role): Role of the speaker
         - `ensure_json` (bool): Ensure the response is a valid JSON object
+        - `session` (Session): Session to use
         """
-        r = await self.send_raw(prompt, role, ensure_json, 1)
-        return cast(str, r.choices[0].message.content)
+        r = await self.send_raw(prompt, role, ensure_json, 1, session)
+        content = cast(str, r.choices[0].message.content)
+        if session is not None:
+            session.append(Message(role=role.value, content=content))
+        return content
 
-    @validate_call
     def send_sync(self,
                   prompt: str,
                   role: Role = Role.User,
@@ -481,22 +441,11 @@ class Bot(BaseModel):
         except UnidentifiedImageError:
             raise ValueError(f"Unknown image format: {img_url}")
         seg._cache = img
+        seg._dims = img.size
         return img
 
-    async def get_b64url_from_seg(
-        self,
-        seg: Message.ImageSegment,
-    ):
-        if seg.image_url.url.startswith("base64://"):
-            return f"data:image/jpeg;base64,{seg.image_url.url[9:]}"
-        # return seg.image_url.url
-        img = await self.cache_image_seg(seg)
-        jpeg_data = BytesIO()
-        img.convert("RGB").save(jpeg_data, format="jpeg", optimize=True, quality=85)
-        jpeg_data.seek(0)
-        return f"data:image/jpeg;base64,{b64encode(jpeg_data.read()).decode('utf-8')}"
-
     def _get_json(self,
+                  session: Session,
                   ensure_json: bool = False,
                   stream: bool = False,
                   choices: int = 1,
@@ -511,14 +460,17 @@ class Bot(BaseModel):
             comp_tokens = int(min(self.comp_tokens*total_tokens, spare_tokens))
         else:
             comp_tokens = int(min(self.comp_tokens, spare_tokens))
+        msgs: list[str, dict[str, Any]] = [{"role": "system", "content": self.prompt}]
+        msgs.extend(m.model_dump(mode="json", exclude_none=True)
+                    for m in session.messages)
         ret: dict[str, Any] = {
-            "messages": [{"role": "system", "content": self.prompt}] + self._sess,
+            "messages": msgs,
             "model": self.model.value,
             "frequency_penalty": self.frequency_penalty,
             "logit_bias": self.logit_bias,
             "logprobs": self.logprobs,
-            # limited by openai but not specified anythere...
             "max_tokens": min(4096, comp_tokens),
+            # limited by openai but not specified anythere...
             "n": choices,
             "presence_penalty": self.presence_penalty,
             "seed": self.seed,
@@ -553,24 +505,160 @@ class Bot(BaseModel):
 
         return ret
 
-    async def _proc_prompt(self, prompt: Prompt) -> str | list[dict]:
+    async def _proc_prompt(self, prompt: Prompt) -> str | list[SegTypes]:
         if isinstance(prompt, str):
             return prompt
-        ret = list[dict]()
+        ret = list[SegTypes]()
         for seg in prompt:
-            if isinstance(seg, Message.TextSegment):
-                ret.append(seg.model_dump())
-            elif isinstance(seg, Message.ImageSegment):
-                img = await self.cache_image_seg(seg)
-                ret.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": await self.get_b64url_from_seg(seg),
-                        "detail": seg.image_url.detail,
-                    },
-                    "dims": img.size,
-                })
-            else:
-                raise ValueError(f"Invalid segment type: {seg}")
+            if isinstance(seg, Message.ImageSegment):
+                await self.cache_image_seg(seg)
+            ret.append(seg)
 
         return ret
+
+
+class Session(Sequence, BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+    bot: Bot | None = Field(exclude=True)
+    messages: list[Message] = Field(default_factory=list)
+
+    def trim(self, target_max: int | None = None, bot: Bot | None = None) -> int:
+        """
+        Trim the session until it's less than `target_max` tokens.
+        Returns the total number of tokens after trimming.
+        """
+        bot = self.bot if bot is None else bot
+        if bot is None:
+            raise ValueError("bot is not set")
+        if target_max is None:
+            model_max_tokens = INFO_MAP[bot.model].max_tokens
+            if bot.comp_tokens < 1:
+                target_max = int((1-bot.comp_tokens) * model_max_tokens)
+            else:
+                target_max = max(0, model_max_tokens-int(bot.comp_tokens))
+
+        # modified from official doc: https://platform.openai.com/docs/guides/text-generation/managing-tokens
+        try:
+            encoding = tiktoken.encoding_for_model(bot.model.value)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        def sizeof_prompt(prompt: str | list[SegTypes]) -> int:
+            if isinstance(prompt, str):
+                return len(encoding.encode(prompt))
+            size = 0
+            for seg in prompt:
+                if isinstance(seg, Message.TextSegment):
+                    size += len(encoding.encode(seg.text))
+                elif isinstance(seg, Message.ImageSegment):
+                    # from https://community.openai.com/t/how-do-i-calculate-image-tokens-in-gpt4-vision/492318
+                    size += 85
+                    if seg.image_url.detail != "low":
+                        size += 170 * \
+                            math.ceil(seg._dims[0] / 512) * \
+                            math.ceil(seg._dims[1] / 512)
+                else:
+                    raise ValueError(f"Invalid segment type: {seg['type']}")
+            return size
+        num_tokens = 4 + sizeof_prompt(bot.prompt)
+        num_tokens += 2  # every reply is primed with <im_start>assistant
+        if num_tokens >= target_max:
+            raise ValueError("The prompt is already too long")
+        msg_cnt = 0
+        for message in reversed(self.messages):
+            # every message follows <im_start>{role/name}\n{content}<im_end>\n
+            this_tokens = 4
+            if message.name is not None:
+                this_tokens -= 1
+            this_tokens += sizeof_prompt(message.role)
+            this_tokens += sizeof_prompt(message.content)
+            if num_tokens + this_tokens >= target_max:
+                break
+            msg_cnt += 1
+            num_tokens += this_tokens
+        self.messages = self.messages[len(self.messages)-msg_cnt:]
+        return num_tokens
+
+    @validate_call
+    def append(self, msg: Message) -> None:
+        self.messages.append(msg)
+
+    def pop(self, index: int = -1) -> Message:
+        return self.messages.pop(index)
+
+    def rollback(self, num: int):
+        """
+        Roll back `num` messages.
+        """
+        self.messages = self.messages[:len(self.messages)-num]
+
+    def clear(self):
+        """
+        Clear the session.
+        """
+        self.messages.clear()
+
+    @validate_call
+    async def stream(self,
+                     prompt: Prompt,
+                     role: Role = Role.User,
+                     ensure_json: bool = False,
+                     ) -> AsyncGenerator[str, None]:
+        """
+        Stream messages from the bot.
+
+        ## Parameters
+        - `prompt` (str): What to say
+        - `role` (Role): Role of the speaker
+        - `ensure_json` (bool): Ensure the response is a valid JSON object
+        - `session` (Session): Session to use
+        """
+        if self.bot is None:
+            raise ValueError("bot is not set")
+        async for r in self.bot.stream(prompt, role, ensure_json, self):
+            yield r
+
+    @validate_call
+    async def send(self,
+                   prompt: Prompt,
+                   role: Role = Role.User,
+                   ensure_json: bool = False,
+                   ) -> str:
+        """
+        Send a message to the bot.
+
+        ## Parameters
+        - `prompt` (str): What to say
+        - `role` (Role): Role of the speaker
+        - `ensure_json` (bool): Ensure the response is a valid JSON object
+        """
+        if self.bot is None:
+            raise ValueError("bot is not set")
+        return await self.bot.send(prompt, role, ensure_json, self)
+
+    def __iter__(self):
+        return iter(self.messages)
+
+    def __len__(self):
+        return len(self.messages)
+
+    def __bool__(self):
+        return bool(self.messages)
+
+    def __reversed__(self):
+        return reversed(self.messages)
+
+    @overload
+    def __getitem__(self, index: int) -> Message:
+        ...
+
+    @overload
+    def __getitem__(self, s: slice) -> list[Message]:
+        ...
+
+    def __getitem__(self, index: int | slice):
+        return self.messages[index]
+
+    @validate_call
+    def __setitem__(self, index: int, value: Message):
+        self.messages[index] = value
