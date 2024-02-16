@@ -11,7 +11,6 @@ from typing import Any, Self, AsyncGenerator, Literal, Generator
 from typing import TypeAlias, cast
 from enum import Enum
 from datetime import datetime
-from uuid import uuid4
 from warnings import warn
 from pydantic import BaseModel, Field, validate_call, PrivateAttr
 from pydantic import field_validator, model_validator, ConfigDict
@@ -215,6 +214,8 @@ class Bot(BaseModel):
     # retries: int = 5
     _sess: list[dict] = PrivateAttr(default_factory=list)
     _cli: httpx.AsyncClient = PrivateAttr(default=None)
+    _last_proxy: str | None = PrivateAttr(default=None)
+    _last_timeout: float | None = PrivateAttr(default=None)
 
     @property
     def session(self) -> tuple[Message, ...]:
@@ -227,7 +228,9 @@ class Bot(BaseModel):
 
     @model_validator(mode="after")
     def post_init(self) -> Self:
-        self.respawn_cli()
+        if (cast(None | httpx.AsyncClient, self._cli) is None
+                or self.proxy != self._last_proxy or self.timeout != self._last_timeout):
+            self.respawn_cli()
         return self
 
     @field_validator("model")
@@ -244,6 +247,8 @@ class Bot(BaseModel):
         """
         Create a new HTTP client, replacing the old one if it exists.
         """
+        self._last_proxy = self.proxy
+        self._last_timeout = self.timeout
         self._cli = httpx.AsyncClient(proxy=self.proxy,
                                       timeout=self.timeout,
                                       trust_env=False,
