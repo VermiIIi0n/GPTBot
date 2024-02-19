@@ -517,7 +517,7 @@ class Bot(BaseModel):
         return ret
 
 
-class Session(Sequence, BaseModel):
+class Session(BaseModel, Sequence[Message]):
     model_config = ConfigDict(validate_assignment=True)
     bot: Bot | None = Field(exclude=True)
     messages: list[Message] = Field(default_factory=list)
