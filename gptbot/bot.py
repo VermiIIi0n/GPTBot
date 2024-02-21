@@ -132,7 +132,9 @@ class Message(BaseModel):
 
     role: Role
     name: str | None = None
-    content: str | list[TextSegment | ImageSegment] = ""
+    content: str | list[TextSegment | ImageSegment] = ''
+    function_call: Any | None = None
+    tool_calls: Any | None = None
 
     def __str__(self):
         if isinstance(self.content, str):
@@ -162,9 +164,9 @@ class FullChunkResponse(BaseModel):
     id: str = ""
     choices: list[Choice]
     created: int
-    model: str = ""
+    model: str | None = None
     system_fingerprint: str | None = None
-    obj: str = Field(default="", alias="object")
+    obj: str | None = Field(default=None, alias="object")
 
 
 class FullResponse(BaseModel):
@@ -185,9 +187,9 @@ class FullResponse(BaseModel):
     id: str = ""
     choices: list[Choice]
     created: int
-    model: str = ""
+    model: str | None = None
     system_fingerprint: str | None = None
-    obj: str = Field(default="", alias="object")
+    obj: str | None = Field(default=None, alias="object")
     usage: Usage
 
 
