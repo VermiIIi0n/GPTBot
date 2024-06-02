@@ -1,10 +1,20 @@
 # Simple Wrapper For The ChatGPT API
 
-This module is designed for asynchronous usage and provides a simple interface to the OpenAI ChatGPT API.
+This module is designed for asynchronous usage and provides a simple interface to the OpenAI ChatGPT API
 
 It also provides a command-line interface for interactive usage.
 
 While it does provide synchronous methods, it is recommended to use the asynchronous methods for better performance.
+
+## Features
+
+- Asynchronous API
+- Get/Stream responses
+- Save/Load session history
+- Change parameters on the fly
+- Embed images in messages
+- Register functions to `tool_calls` with ease
+- Interactive command-line interface
 
 ## Installation
 
@@ -103,4 +113,15 @@ async def main():
     print(await session.send("Goodbye!"))
 
 asyncio.run(main())
+```
+
+### Registering Functions
+
+Functions are under `Bot.funcs` and can be registered with the `add_func` decorator.
+
+```python
+@bot.add_func
+def my_func(data: str, default:int = 123):  # parameters must be annotated, variadic parameters are not supported
+    """Documentation goes here"""
+    return data  # return value must be stringifiable
 ```

@@ -7,23 +7,34 @@ import httpx
 import ujson as json
 import tiktoken
 import math
+import inspect
+import asyncio
+import warnings
 from typing import Any, Iterable, Self, AsyncGenerator, Literal, Generator, overload
-from typing import TypeAlias, cast, Sequence
+from typing import TypeAlias, cast, Sequence, TypeVar, get_origin, get_args
 from enum import Enum
 from datetime import datetime
 from warnings import warn
 from pydantic import BaseModel, Field, validate_call, PrivateAttr
 from pydantic import field_validator, model_validator, ConfigDict
-from pydantic import field_serializer
+from pydantic import field_serializer, computed_field
 from vermils.asynctools import sync_await
 from PIL import Image, UnidentifiedImageError
 from pathlib import Path
+from itertools import chain
 from base64 import b64encode, b64decode
 from io import BytesIO
 from vermils.io import aio
 
 
+T = TypeVar('T')
+
+
 class Model(str, Enum):
+    GPT4o = "gpt-4o"
+    GPT4o_2024_05_13 = "gpt-4o-2024-05-13"
+    GPT4Turbo = "gpt-4-turbo"
+    GPT4Turbo_2024_04_09 = "gpt-4-turbo-2024-04-09"
     GPT4_0125_Preview = "gpt-4-0125-preview"
     GPT4TurboPreview = "gpt-4-turbo-preview"
     GPT4_1106_Preview = "gpt-4-1106-preview"
@@ -51,6 +62,10 @@ class ModelInfo(BaseModel):
 
 
 INFO_MAP: dict[Model, ModelInfo] = {
+    Model.GPT4o: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 10, 1)),
+    Model.GPT4o_2024_05_13: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 10, 1)),
+    Model.GPT4Turbo: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 12, 1)),
+    Model.GPT4Turbo_2024_04_09: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 12, 1)),
     Model.GPT4_0125_Preview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
     Model.GPT4TurboPreview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
     Model.GPT4_1106_Preview: ModelInfo(max_tokens=128000, updated_at=datetime(2023, 4, 1)),
@@ -75,6 +90,7 @@ class Role(str, Enum):
     User = "user"
     Assistant = "assistant"
     System = "system"
+    Tool = "tool"
 
 
 class Message(BaseModel):
@@ -132,14 +148,15 @@ class Message(BaseModel):
 
     role: Role
     name: str | None = None
-    content: str | list[TextSegment | ImageSegment] = ''
+    content: None | str | list[TextSegment | ImageSegment] = ''
     function_call: Any | None = None
-    tool_calls: Any | None = None
+    tool_calls: list | None = None
+    tool_call_id: str | None = None
 
     def __str__(self):
         if isinstance(self.content, str):
             return self.content
-        return ''.join(str(seg) for seg in self.content)
+        return ''.join(str(seg) for seg in self.content or '')
 
 
 SegTypes: TypeAlias = Message.TextSegment | Message.ImageSegment
@@ -227,7 +244,6 @@ class Bot(BaseModel):
     stop: list[str] | None = None
     temperature: float = 0.5
     top_p: float = 1.0
-    tools: list[dict[str, Any]] | None = None
     tool_choice: Literal["auto", "none"] | dict[str, Any] = "auto"
     user: str | None = None
 
@@ -238,6 +254,86 @@ class Bot(BaseModel):
     _cli: httpx.AsyncClient = PrivateAttr(default=None)
     _last_proxy: str | None = PrivateAttr(default=None)
     _last_timeout: float | None = PrivateAttr(default=None)
+    _funcs: list[Any] = PrivateAttr(default_factory=list)
+
+    @property
+    def funcs(self):
+        return self._funcs
+
+    @computed_field
+    def tools(self) -> list[dict[str, Any]] | None:
+        if not self._funcs:
+            return None
+
+        def _2typename(t):
+            if not issubclass(t, (int, float, str, bool)):
+                raise ValueError(f"Invalid type {t}")
+            return {
+                int: "integer",
+                float: "number",
+                str: "string",
+                bool: "boolean"
+            }[t]
+
+        ret = list[dict[str, Any]]()
+        for f in self.funcs:
+            d: dict[str, Any] = {
+                "type": "function",
+                "function": {
+                    "name": f.__name__,
+                    "description": f.__doc__ or '',
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                }
+            }
+            argspecs = inspect.getfullargspec(f)
+            defaults = argspecs.defaults or tuple()
+            kwonlydefaults = argspecs.kwonlydefaults or dict()
+            annotations = argspecs.annotations or dict()
+            if argspecs.varargs is not None or argspecs.varkw is not None:
+                warnings.warn(
+                    "Variadic arguments are not supported in tools", UserWarning)
+            for arg in chain(argspecs.args, argspecs.kwonlyargs):
+                if arg not in annotations:
+                    raise ValueError(f"Missing annotation for {arg}")
+                enums: tuple[Any, ...] | None = None
+                type_ = annotations[arg]
+                optional = False
+
+                if get_origin(type_) is Literal:
+                    enums = get_args(type_)
+                elif issubclass(type_, Enum):
+                    enums = tuple(e.value for e in type_)
+                if enums is not None:
+                    if not enums:
+                        raise ValueError(f"Empty enum/literals for {arg}")
+                    type_ = type(enums[0])
+
+                if arg in argspecs.kwonlyargs:
+                    optional = arg in kwonlydefaults
+                else:
+                    optional = arg in argspecs.args[-len(defaults):]
+
+                p = {
+                    "type": _2typename(type_),
+                    "description": "",
+                }
+                if enums is not None:
+                    p["enum"] = enums
+
+                d["function"]["parameters"]["properties"][arg] = p
+                if not optional:
+                    d["function"]["parameters"]["required"].append(arg)
+            ret.append(d)
+
+        return ret
+
+    def add_func(self, f: T) -> T:
+        self._funcs.append(f)
+        return f
 
     @model_validator(mode="after")
     def post_init(self) -> Self:
@@ -272,15 +368,10 @@ class Bot(BaseModel):
         return Session(bot=self, messages=list(messages))
 
     async def stream_raw(self,
-                         prompt: Prompt,
-                         role: Role = Role.User,
+                         session: Session,
                          ensure_json: bool = False,
                          choices: int = 1,
-                         session: Session | None = None
                          ) -> AsyncGenerator[FullChunkResponse, None]:
-        session = self.new_session() if session is None else session
-        session.append(Message(
-            role=role.value, content=await self._proc_prompt(prompt)))
         used_tokens = session.trim(bot=self)
 
         async with self._cli.stream(
@@ -324,17 +415,41 @@ class Bot(BaseModel):
         """
 
         content = ''
-        async for r in self.stream_raw(prompt, role, ensure_json, 1, session):
-            choice = r.choices[0]
-            if choice.finish_reason is not None:
+        session = self.new_session() if session is None else session
+        session.append(Message(
+            role=role.value, content=await self._proc_prompt(prompt)))
+        tool_calls: None | list[dict[str, Any]] = None
+        choice: None | FullChunkResponse.Choice = None
+        while True:
+            async for r in self.stream_raw(session, ensure_json, 1):
+                choice = r.choices[0]
+                if choice.delta.tool_calls is not None:
+                    for i, tc in enumerate(choice.delta.tool_calls):
+                        if tool_calls is None:
+                            tool_calls = []
+                        if len(tool_calls) <= i:
+                            if tc["type"] != "function":
+                                continue
+                            tool_calls.append(tc)
+                        tool_calls[i]["function"]["arguments"] += tc["function"]["arguments"]
+                if choice.delta.role is not None:
+                    role = choice.delta.role
+                if choice.delta.content is not None:
+                    content += choice.delta.content
+                    yield choice.delta.content
+            session.append(
+                Message(role=role.value, content=content, tool_calls=tool_calls))
+            if choice is not None and choice.finish_reason == "tool_calls":
+                rets = await self._proc_toolcalls(tool_calls or [])
+                for fname, id_, ret in rets:
+                    session.append(Message(
+                        role=Role.Tool.value,
+                        name=fname,
+                        content=await self._proc_prompt(str(ret)),
+                        tool_call_id=id_)
+                    )
                 continue
-            if choice.delta.role is not None:
-                role = choice.delta.role
-            if choice.delta.content is not None:
-                content += choice.delta.content
-                yield choice.delta.content
-        if session is not None:
-            session.append(Message(role=role.value, content=content))
+            break
 
     def stream_sync(self,
                     prompt: Prompt,
@@ -344,15 +459,10 @@ class Bot(BaseModel):
         raise NotImplementedError
 
     async def send_raw(self,
-                       prompt: Prompt,
-                       role: Role = Role.User,
+                       session: Session,
                        ensure_json: bool = False,
                        choices: int = 1,
-                       session: Session | None = None
                        ) -> FullResponse:
-        session = self.new_session() if session is None else session
-        session.append(Message(
-            role=role.value, content=await self._proc_prompt(prompt)))
         used_tokens = session.trim(bot=self)
 
         r = await self._cli.post(
@@ -384,11 +494,27 @@ class Bot(BaseModel):
         - `ensure_json` (bool): Ensure the response is a valid JSON object
         - `session` (Session): Session to use
         """
-        r = await self.send_raw(prompt, role, ensure_json, 1, session)
-        content = cast(str, r.choices[0].message.content)
-        if session is not None:
-            session.append(Message(role=role.value, content=content))
-        return content
+        session = self.new_session() if session is None else session
+        session.append(Message(
+            role=role.value, content=await self._proc_prompt(prompt)))
+        while True:
+            r = await self.send_raw(session, ensure_json, 1)
+            choice = r.choices[0]
+            message = choice.message
+            content = cast(str, choice.message.content)
+            session.append(Message(
+                role=message.role.value, content=content, tool_calls=message.tool_calls))
+            if choice.finish_reason == "tool_calls":
+                rets = await self._proc_toolcalls(message.tool_calls or [])
+                for fname, id_, ret in rets:
+                    session.append(Message(
+                        role=Role.Tool.value,
+                        name=fname,
+                        content=await self._proc_prompt(str(ret)),
+                        tool_call_id=id_)
+                    )
+                continue
+            return content
 
     def send_sync(self,
                   prompt: str,
@@ -496,8 +622,9 @@ class Bot(BaseModel):
 
         remove_null(ret)
 
-        if self.tools is not None:
-            ret["tools"] = self.tools
+        tools = self.tools
+        if tools is not None:
+            ret["tools"] = tools
             ret["tool_choice"] = self.tool_choice
 
         if (ensure_json):
@@ -516,6 +643,32 @@ class Bot(BaseModel):
                 await self.cache_image_seg(seg)
             ret.append(seg)
 
+        return ret
+
+    async def _proc_toolcalls(self, tool_calls: list[dict[str, Any]]) -> list[tuple[str, str, Any]]:
+        ret = list[tuple[str, str, Any]]()
+        func_map = {f.__name__: f for f in self.funcs}
+        async_funcs = list[Any]()
+
+        async def wrap(id_, afunc, kw):
+            return afunc.__name__, id_, (await afunc(**kw))
+        for tc in tool_calls:
+            if tc["type"] != "function":
+                continue
+            f = func_map.get(tc["function"]["name"])
+            if f is None:
+                raise ValueError(f"Function not found: {tc["function"]["name"]}")
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                raise RuntimeError(f"GPT returned invalid JSON for tool calls: {
+                                   tc["function"]["arguments"]}")
+            if inspect.iscoroutinefunction(f):
+                async_funcs.append(wrap(tc["id"], f, args))
+            else:
+                ret.append((f.__name__, tc["id"], f(**args)))
+        if async_funcs:
+            ret.extend(await asyncio.gather(*async_funcs))
         return ret
 
 
@@ -573,7 +726,8 @@ class Session(BaseModel, Sequence[Message]):
             if message.name is not None:
                 this_tokens -= 1
             this_tokens += sizeof_prompt(message.role)
-            this_tokens += sizeof_prompt(message.content)
+            this_tokens += sizeof_prompt(message.content or '')
+            this_tokens += sizeof_prompt(json.dumps(message.tool_calls or []))
             if num_tokens + this_tokens >= target_max:
                 break
             msg_cnt += 1
